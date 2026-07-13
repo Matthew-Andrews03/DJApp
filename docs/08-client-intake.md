@@ -34,12 +34,18 @@ adapters; marked ✅ are required before any module can switch on.
 15. What does a new customer cost you / what's an average customer worth per year? (anchors
     the revenue-recovered math in reporting)
 
-## C. Systems inventory ⚙ (decides adapter rungs)
+## C. Systems inventory ⚙ (decides which connectors the client sees — drives spec 12 resolver)
 
-16. POS / booking system(s): name + plan tier
+15b. Website platform: which builder is your site on? (Wix / WordPress / Shopify / Squarespace /
+    other / not sure) → `client_profile.website_platform`
+16. POS / booking system(s): name + plan tier → `client_profile.pos_system`
+    - **Do your bookings/sales run THROUGH your website (e.g. Wix Bookings), or a separate tool?**
+      → `client_profile.website_handles_bookings` (this decides whether the website connector
+      alone covers sales, or a separate booking connector is also needed — spec 12 rule 1/2)
     - Does it send "sale completed" / "booking confirmed" notification emails? → forward a
       sample to `{client}@in.seekly.app` (rung 3 live immediately)
-    - Does it support webhooks/Zapier? (rung 2) · Does it have an API/OAuth? (rung 1 candidate)
+    - Does it support webhooks/Zapier? (rung 2) · Does it have an API/OAuth? (rung 1 candidate —
+      if enough clients use it, promote to a native adapter per spec 11)
 17. Customer list export: can you export customers with phone + last visit date? (CSV template
     provided) ✅ for reactivation
 18. Website forms: which forms exist, where do their notification emails go? → CC/forward to

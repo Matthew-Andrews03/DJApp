@@ -94,7 +94,9 @@ export interface ResolvedConnector { provider: string; requirement: Requirement;
 
 export function resolveConnectors(input: {
   websitePlatform?: string;      // client_profile.website_platform ("wix"|"wordpress"|"shopify"|"other"|…)
-  posSystem?: string;            // free-text/normalized POS name from intake
+  websiteHandlesBookings?: boolean; // intake Q: do sales/bookings actually run THROUGH the website
+                                    //   (e.g. Wix Bookings/eCom) vs a separate tool?
+  posSystem?: string;            // normalized name of the booking/POS system from intake
   usesMetaAds?: boolean;         // intake Q
   hasCustomerList?: boolean;     // intake Q (can export CSV / has contacts)
   enabledModules: string[];      // purchased tier's modules
@@ -104,13 +106,19 @@ export function resolveConnectors(input: {
 Resolution rules (junior-dev implementable, in order):
 
 1. **Website / primary platform.** Map `websitePlatform` to a catalog website connector:
-   `wix→wix`, `wordpress→wordpress`, `shopify→shopify`(wave-gated), else none.
-   - If it's **Wix**, mark `wix` **required** — and because Wix also emits `sale.completed`,
-     `lead.created`, `customer.imported`, the resolver **suppresses** the POS and CSV connectors
-     for this client (Wix already covers them). This is the "one connection" outcome.
-2. **POS / booking** (only if website connector doesn't already emit `sale.completed` and a
-   review/reactivation module is enabled): map `posSystem` to a native connector
-   (`square`, `calendly`, …). If no native adapter matches → `email_parse` (**required**).
+   `wix→wix`, `wordpress→wordpress`, `shopify→shopify`(wave-gated), else none. Mark it
+   **required** (it's the publishing target for the content engine).
+   - **Suppress the POS/CSV connectors ONLY if the website itself handles sales/bookings** —
+     i.e. `websitePlatform==='wix' && websiteHandlesBookings===true` (Wix Bookings/eCom in use),
+     since Wix then already emits `sale.completed` + `customer.imported`. This is the
+     "one connection" outcome. Shopify behaves the same when it's their checkout.
+2. **POS / booking** — resolve a *separate* booking/POS connector when the website does **not**
+   emit `sale.completed` (i.e. step 1 didn't suppress) **and** a review/reactivation module is
+   enabled. Map `posSystem` to a native connector (`square`, `calendly`, `clover`, `acuity`,
+   `jobber`, …). **If no native adapter matches → `email_parse` (required) now, and it becomes a
+   candidate for a new native adapter (spec 11).** So a Wix *marketing* site + a separate golf
+   tee-sheet tool resolves to: `wix` (required, website/content) + that booking connector or
+   `email_parse` (required, sales/reviews) — Wix is NOT allowed to suppress it.
 3. **Reviews:** if `review_automation` or `directory_sync` enabled → `google_business`
    **required**.
 4. **Ads/leads:** if `speed_to_lead` enabled and `usesMetaAds` → `meta` **recommended**; else
@@ -119,15 +127,27 @@ Resolution rules (junior-dev implementable, in order):
    `customer.imported` → `csv_customers` **required** (or `recommended` if the POS backfills it).
 6. De-dupe; drop any connector whose `unlocksModules` are all disabled for this client.
 
-**Worked example — the golf pilot (Wix, runs FB lead ads, all modules):**
+**Worked example A — golf pilot on Wix Bookings** (`websiteHandlesBookings=true`, FB ads, all modules):
 
 | Connector | Requirement | Why |
 |---|---|---|
-| `wix` | required | website=Wix → also covers sales, leads, contacts |
+| `wix` | required | website=Wix AND handles bookings → also covers sales, leads, contacts |
 | `google_business` | required | review_automation + directory_sync |
 | `meta` | recommended | speed_to_lead + usesMetaAds |
 
-→ **3 cards. No Square, no Shopify, no Jobber, no CSV, no email-parse.** That's the whole point.
+→ **3 cards. No POS, no CSV, no email-parse.** The "one connection" outcome.
+
+**Worked example B — Wix marketing site + a SEPARATE booking tool** (`websiteHandlesBookings=false`,
+`posSystem="AcmeTeeSheet"` with no native adapter):
+
+| Connector | Requirement | Why |
+|---|---|---|
+| `wix` | required | website/content publishing target |
+| `email_parse` | required | separate booking tool has no native adapter → forward booking emails for `sale.completed` (candidate for a future native adapter) |
+| `google_business` | required | review_automation + directory_sync |
+| `meta` | recommended | speed_to_lead + usesMetaAds |
+
+→ **4 cards.** Wix does NOT suppress the booking connector because it doesn't see those bookings.
 
 **Acceptance:** unit tests for the pilot case (3 connectors) and a "WordPress + Square + no Meta
 ads" case (wordpress required, square required, google required, meta optional, csv suppressed

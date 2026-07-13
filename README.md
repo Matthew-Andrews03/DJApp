@@ -39,13 +39,16 @@ never integrate with client software directly.
 | [docs/07-build-plan.md](docs/07-build-plan.md) | Tech stack, 30-day build sequence, 2-week milestone, day-1 critical path, costs |
 | [docs/08-client-intake.md](docs/08-client-intake.md) | Intake/discovery form that drives per-client adapters and config |
 | [docs/09-intelligence-platform.md](docs/09-intelligence-platform.md) | Layered memory architecture, experiment ledger, Growth Action Queue, niche playbooks |
+| [docs/10-reusing-seekly-client-insights.md](docs/10-reusing-seekly-client-insights.md) | **Supersedes 02/04/05/07 where they conflict** — platform builds on the existing seekly-client-insights app |
 
 ## Current status
 
 - **Stage:** planning complete → build starting
 - **Pilots:** golf/recreation venue(s), free in exchange for case-study rights
 - **Target:** first engine live for pilot in ~2 weeks; all seven engines in ~30 days
-- **Assets:** brand + domain secured; everything else built per [docs/07-build-plan.md](docs/07-build-plan.md)
+- **Assets:** brand + domain secured; **seekly-client-insights already implements the AI
+  Share-of-Voice product, client portal, review-request funnel, and job infrastructure** —
+  see [docs/10-reusing-seekly-client-insights.md](docs/10-reusing-seekly-client-insights.md)
 
 ## Day-1 critical path (external approvals — start immediately)
 

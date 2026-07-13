@@ -19,6 +19,7 @@ flick of a switch.
 | 5 | Directory Sync | `directory_sync` | NAP + hours synced across directories via BrightLocal |
 | 6 | Competitor Espionage | `competitor_intel` | Monthly AI deep-dive on competitor pricing, offers, review spikes |
 | 7 | Social Syndication | `social_syndication` | Blogs auto-cut into GEO-optimized GBP posts + Facebook updates |
+| 8 | Intelligence / Growth Action Queue | `intelligence` | Layered memory learns what drives each client's revenue; weekly ranked actions |
 
 All engines are **multi-tenant master workflows** in self-hosted n8n. One copy of each workflow
 serves every client, keyed by `client_id`, reading per-client config and toggles from the Seekly
@@ -37,6 +38,7 @@ never integrate with client software directly.
 | [docs/06-integrations.md](docs/06-integrations.md) | OAuth apps, GBP, Meta, Twilio/A2P, BrightLocal, POS adapter ladder |
 | [docs/07-build-plan.md](docs/07-build-plan.md) | Tech stack, 30-day build sequence, 2-week milestone, day-1 critical path, costs |
 | [docs/08-client-intake.md](docs/08-client-intake.md) | Intake/discovery form that drives per-client adapters and config |
+| [docs/09-intelligence-platform.md](docs/09-intelligence-platform.md) | Layered memory architecture, experiment ledger, Growth Action Queue, niche playbooks |
 
 ## Current status
 

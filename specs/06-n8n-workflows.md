@@ -502,4 +502,474 @@ Every table lists nodes in wiring order; branch nodes state where each output go
 9. Two consecutive AI turns with confidence < 0.5 → auto-handoff on the second.
 10. Inbound from unknown phone → `message.unrouted` activity, no SMS, no crash.
 
-<!-- PART3 -->
+---
+
+### 3.4 WF-3 Reactivation — Campaign Runner
+
+**Module:** `reactivation`. Settings (defaults): `lapse_days: 90`, `batch_size_per_day: 50`, `stop_rate_pause_pct: 3`, `send_hour_local: 11` (advisory — the pipeline still enforces quiet hours), approval rule: first-ever campaign for a client is always `approve_first` (doc 03 flow 3).
+**Audience building** (CSV import, `sale.completed` upserts into `customers`) is control-plane work, not n8n. Campaign creation + audience filter selection happens in the portal/admin (SPEC-05). WF-3 does two jobs: **(a) compose** copy variants for a draft campaign, **(b) run** approved campaigns in daily batches.
+
+**Triggers (two, same workflow):**
+- Webhook path `campaign-launch`, event `campaign.launch` (`payload: {campaign_id, stage: "compose" | "send"}`) — emitted by the control plane when a campaign is created (compose) or approved/launched (send).
+- Schedule cron `0 15 * * *` UTC (daily continuation) → Shape-B head over `GET /api/internal/clients?module=reactivation&enabled=true`, then per client `GET /api/internal/campaigns?client_id=…&status=sending` → for each, run the SEND lane below with `campaign_id`. Use a `Merge` node (`n8n-nodes-base.merge`, mode Append) to join both trigger paths into the common lane; a `Code` node normalizes to `{client_id, campaign_id, stage}`.
+
+| # | Node name | Type | Key parameters |
+|---|---|---|---|
+| 1–6 | *(Head A for the webhook path / Head B for the cron path, module `reactivation`)* | | |
+| 7 | `Get Campaign` | HTTP Request | GET `…/api/internal/campaigns/{{ $json.campaign_id }}` → `{status, angle, copy_variants, audience_filter, stats}`. |
+| 8 | `Stage?` | Switch | `compose` → node 9; `send` (or cron continuation with `status==='sending'||'approved'`) → node 12; anything else → `Log Skipped`. |
+| — | **COMPOSE lane** | | |
+| 9 | `Compose Variants (Claude)` | HTTP Request | Anthropic call (§2.8): model `claude-sonnet-5`, `max_tokens: 1200`, system **Prompt 4.3**, user content: JSON `{angle: <campaign.angle resolved from profile.campaign_angles>, business, services, lapse_days, booking_link}`; `output_config` schema §4.3 (3 variants + merge-field slots). Retry 2×; on error → ops email "composer failed" + PATCH campaign `status:"draft"` unchanged. |
+| 10 | `Guard Variants` | Code | Deterministic checks per variant: contains `{first}` slot; contains opt-out-safe copy (pipeline appends STOP footer — variant must NOT contain its own); length ≤ 320 chars; no `$`-price unless the angle's `offer` text contains it verbatim; no banned phrases (`profile.brand_voice.phrases_avoid`). Fail → drop variant; if <2 survive → ops email + stop. |
+| 11 | `Save Variants` | HTTP Request | PATCH campaign `{"copy_variants": [...], "status": "pending_approval"}` + activity `campaign.composed`. Portal approval (SPEC-05) flips to `approved` and emits `campaign.launch{stage:"send"}`. Lane ends. |
+| — | **SEND lane** | | |
+| 12 | `Send Gates` | IF | ALL of: `{{ $('Get Context').item.json.module.enabled }}` · `{{ $('Get Context').item.json.comms.a2p_campaign_status === 'approved' }}` · `{{ ['approved','sending'].includes($('Get Campaign').item.json.status) }}`. False → activity `campaign.gated` detail reason → NoOp. (A2P is a hard gate — doc 06.) |
+| 13 | `Mark Sending` | HTTP Request | PATCH campaign `{"status":"sending"}` (idempotent). |
+| 14 | `Fetch Today's Batch` | HTTP Request | GET `…/api/internal/campaigns/{{ campaign_id }}/members?status=queued&limit={{ $('Get Context').item.json.module.settings.batch_size_per_day ?? 50 }}` → `[{customer_id, name, phone, last_visit_at, visit_count}]` (control plane already excluded: opt-outs, active conversations, freq-capped, no-consent — doc 03 gate 1; ranked by historical value, gate 2). |
+| 15 | `Empty?` | IF | `{{ $json.members.length === 0 }}` → true: `Finalize Campaign` — GET members count `status=queued`; if 0 → PATCH campaign `{"status":"done"}` + activity `campaign.done` → NoOp. |
+| 16 | `Loop Members` | Split In Batches | Batch Size `1`. |
+| 17 | `Merge Fields` | Code | Rotate variants: `const v = campaign.copy_variants[ index % campaign.copy_variants.length ]`; replace `{first}` (fallback "there"), `{business}`, `{last_visit_note}` (e.g. "It's been a few months since your last visit" derived from `last_visit_at` — template phrasing, not LLM), `{offer}`, `{booking_link}`. Output `{body, variant_id}`. |
+| 18 | `Send Campaign SMS` | HTTP Request | POST `…/api/internal/send` `{"kind":"marketing","engine":"wf-3","campaign_id":"…","customer":{"phone":"…","name":"…"},"body":…,"idempotency_key":"{{ campaign_id }}:{{ $json.customer_id }}"}`. Marketing kind → pipeline enforces quiet hours (queues), 30-day cross-engine frequency cap, opt-out, A2P. |
+| 19 | `Update Member` | HTTP Request | PATCH `…/api/internal/campaigns/{{ campaign_id }}/members/{{ customer_id }}` body `{"status": "{{ ['sent','queued','duplicate'].includes($json.status) ? 'sent' : 'excluded' }}", "detail":{"send_status":"{{ $json.status }}","blocked_reason":"{{ $json.blocked_reason ?? '' }}"}}` → **the resume ledger**: a crash between 18 and 19 is healed by the `duplicate` response on re-run (member re-selected as `queued`, send dedupes, member then marked `sent`). Loop back to node 16. |
+| 20 | `STOP-rate Check` | HTTP Request | After loop completes: GET `…/api/internal/campaigns/{{ campaign_id }}/stats?window=24h` → `{sent, stops, stop_rate}`. |
+| 21 | `Too Many STOPs?` | IF | `{{ $json.stop_rate > (($('Get Context').item.json.module.settings.stop_rate_pause_pct ?? 3) / 100) && $json.sent >= 20 }}` (min-sample guard). True → `Auto-Pause`: PATCH campaign `{"status":"paused"}` + activity `campaign.autopaused` `status:"failed"` detail `{stop_rate}` + ops email "STOP-rate breach — campaign paused" (doc 03 failure handling). |
+| 22 | `Log Batch` | HTTP Request | POST activity `action:"campaign.batch_sent"` detail `{sent, queued, excluded, campaign_id}`. |
+
+**Replies:** inbound answers route through WF-2B (node 7 there selects `module=reactivation` for `engine:"wf-3"` conversations); the AI books them or hands off — same loop, same prompt with reactivation context. The send-pipeline creates/links the `conversation_id` on first inbound (SPEC-03).
+**Idempotency:** `campaign_members` ledger + `campaign_id:customer_id` send keys — a mid-batch crash never re-texts anyone (doc 03).
+
+**Acceptance tests (WF-3)**
+
+1. Compose stage on a draft campaign → 3 guarded variants saved, status `pending_approval`, nothing sent.
+2. Launch with A2P `submitted` (not approved) → gated, zero sends, activity `campaign.gated` reason `a2p_pending`.
+3. Approved campaign, 120 queued members, `batch_size_per_day: 50` → day 1: 50 sent; day 2 cron: 50; day 3: 20 + campaign flips `done`.
+4. Kill n8n mid-batch after 23 sends; re-run → ledger shows exactly 120 sends total, zero duplicates (spot-check the 23: `duplicate` responses, members `sent`).
+5. Member opted out between queueing and send → `blocked/opt_out`, member `excluded`, not retried.
+6. Simulate 2 STOP replies in first 40 sends (5%) → campaign auto-paused, ops email, remaining members still `queued`.
+7. Flip `reactivation` switch off mid-campaign → next daily cron gates out; members remain `queued`; flipping back on resumes exactly where it left off.
+8. Variant containing "only $99 today!" when the approved angle has no price → guard drops it; if <2 variants remain, composer halts with ops alert.
+9. Reply "YES sounds fun" to a campaign SMS → WF-2B routes with `module=reactivation`, AI answers using the campaign angle context, conversation linked to campaign for attribution.
+10. Campaign stats after completion → `stats.sent/replies/stops/bookings/revenue_est` populated (booking/revenue via conversation outcomes) — feeds the portal case-study numbers.
+
+---
+
+### 3.5 WF-4 Content Engine
+
+**Module:** `content_engine`. Settings (defaults): `cadence: "1,15"` (days-of-month), `publish_hour_utc: 7`, `min_words: 900`, `approval_mode: "approve_first_3"`, `publishing_target: "wordpress" | "email_draft"`, `webmaster_email` (for email_draft), `schema_profile: ["LocalBusiness","Service","FAQPage"]`.
+**Trigger:** Schedule cron `0 7 1,15 * *` (UTC). Per-client cadence honored by the claim-topic endpoint (it refuses if the client isn't due).
+
+| # | Node name | Type | Key parameters |
+|---|---|---|---|
+| 1–6 | *(Head B, module `content_engine`)* | | |
+| 7 | `Claim Topic` | HTTP Request | POST `…/api/internal/content/claim-topic` body `{"client_id":"{{ $json.client_id }}","period":"{{ $now.toFormat('yyyy-LL') }}-{{ $now.day <= 7 ? 'a' : 'b' }}"}` → `{claimed, content_item_id, topic, target_keywords, competitor_gap_notes}` or `{claimed:false, reason:"queue_empty"|"not_due"|"already_claimed"}`. Idempotent per (client, period) — a re-run of the cron cannot double-draft. |
+| 8 | `Claimed?` | IF | `{{ $json.claimed }}`. False + reason `queue_empty` → `Ops Alert (replenish queue)` Send Email + activity `content.queue_empty` `status:"failed"` (doc 03: alert ops to replenish). False otherwise → skip-log → next client. |
+| 9 | `Research Snapshot` | HTTP Request | GET `…/api/internal/clients/{{ client_id }}/competitor-snapshots?since={{ $now.minus({days:35}).toISO() }}` (WF-6 data feeds outlines — doc 09). **On Error: Continue** with empty array. |
+| 10 | `Draft Post (Claude)` | HTTP Request | Anthropic call: model `claude-sonnet-5`, `max_tokens: 8000`, system **Prompt 4.6** (WF-4 content drafter, §4.6), user content = JSON `{topic, target_keywords, services, service_areas, competitors_recent: <node 9 extract>, brand_voice, business facts: NAP/hours/booking_link}`; `output_config` json_schema: `{title, slug, meta_description, tldr_html, body_html, faq: [{q, a}], jsonld: object, internal_link_suggestions: []}`. Retry 2×; on error → PATCH content item `{"status":"failed"}` + ops email + next client. |
+| 11 | `Quality Gate` | Code | Deterministic checks (doc 03 flow 4): (1) word count of `body_html` stripped ≥ `min_words`; (2) `JSON.parse`-able `jsonld` with `@type` in schema_profile and `FAQPage` entries matching `faq[]`; (3) every `target_keywords[0..2]` appears ≥1× in body; (4) **no hallucinated facts**: regex `/\$\s?\d|\bfrom \d+ per\b/i` fails the draft unless the matched string exists in `profile` facts; phone/address in body must equal `locations[0]` values; (5) `tldr_html` non-empty and first in body; (6) no placeholder text (`lorem|TODO|\[insert`). Output `{pass, failures[]}`. |
+| 12 | `QA Pass?` | IF | Fail → PATCH content item `{"status":"failed","detail":{failures}}` + activity `content.qa_failed` `status:"failed"` + ops email (schema validation failure blocks publish — doc 03). |
+| 13 | `Approval Needed?` | IF | `{{ $('Get Context').item.json.module.settings.approval_mode === 'approve_first_3' && ($('Get Context').item.json.module.settings.published_count ?? 0) < 3 }}` (published_count maintained by control plane in module settings). True → PATCH content item `{"status":"pending_approval","title":…,"body_html":…,"schema_jsonld":…}` + activity `content.queued_approval` → next client. Approval in portal re-emits `campaign`-style event? No — portal publishes via this same lane by calling the control plane, which emits `content.approved` → **routes to this workflow's second webhook** `Webhook (content-approved)` (path `content-approved`) that jumps straight to node 14 (add this small entry: Head-A nodes 1–4 + `Get Context` + IF enabled → node 14). |
+| 14 | `Save Draft` | HTTP Request | PATCH content item `{"status":"approved","title":…,"body_html": <tldr_html + body_html + faq rendered>,"schema_jsonld": jsonld}`. A Code node `Assemble HTML` right before renders: TL;DR block first, body, FAQ section, `<script type="application/ld+json">{{ jsonld }}</script>` appended (GEO pattern — doc 03). |
+| 15 | `Target?` | Switch | `{{ $('Get Context').item.json.module.settings.publishing_target }}`: `wordpress` → 16a; `email_draft` → 16b; else → park + ops. |
+| 16a | `Publish to WordPress` | HTTP Request | POST `{{ connections.wordpress.base_url }}/wp-json/wp/v2/posts` · Auth: Generic → Basic Auth with `{{ connections.wordpress.username }}` / `{{ connections.wordpress.app_password }}` (values from context — do NOT store as n8n credentials; per-client) · body `{"title":…,"slug":…,"content": <assembled html>,"status":"publish","excerpt": meta_description}` → response `link` is the URL. Retry 3×; **On Error: Continue** → `Park Ready-to-Publish`: PATCH `{"status":"ready_to_publish"}` + ops email (never silently lost — doc 03). |
+| 16b | `Email Draft to Webmaster` | Send Email | To `{{ module.settings.webmaster_email }}` cc ops · Subject `New post for {{ client.business_name }}: {{ title }}` · HTML body = assembled post + publishing instructions + the JSON-LD block. Then PATCH `{"status":"published","published_url":null}` with `detail.channel:"email_draft"`. |
+| 17 | `Mark Published` | HTTP Request | (wordpress lane) PATCH content item `{"status":"published","published_url":"{{ $json.link }}","published_at":"{{ $now.toISO() }}"}`. |
+| 18 | `Emit content.published` | HTTP Request | POST `…/api/internal/events` `{"event_id":"content:{{ content_item_id }}","client_id":…,"type":"content.published","occurred_at":"{{ $now.toISO() }}","source":"wf-4","payload":{"content_item_id":…,"url":"{{ $json.link }}","title":…}}` → fans out to WF-7. Idempotent on the content-item-scoped event_id. |
+| 19 | `Log` | HTTP Request | POST activity `action:"content.published"` `entity_type:"content_item"`. GSC/rankings/SoV tracking is in-app (pg-boss jobs, doc 10) — not n8n. |
+
+**Idempotency:** claim-topic per period; `content:` event id; WP re-publish guarded by content status (`published` items are never re-entered — node 7 refuses with `already_claimed`).
+
+**Acceptance tests (WF-4)**
+
+1. Cron with due client + stocked queue → one content item drafted, QA-passed, published (or queued per approval mode), `content.published` event emitted once.
+2. Re-run the cron the same day → `already_claimed`, zero new drafts.
+3. Empty topic queue → ops email, activity `content.queue_empty`, no draft, other clients proceed.
+4. Draft invents "$25 league night" not present in profile facts → QA fail, status `failed`, ops email, nothing published.
+5. Invalid JSON-LD from the model → QA fail (schema validation blocks publish).
+6. First 3 posts for a new client → all `pending_approval`; 4th auto-publishes. Portal approval of post 2 → published via `content-approved` webhook path, URL captured, event emitted.
+7. WordPress returns 500 ×3 → item `ready_to_publish`, ops email, no `content.published` event.
+8. `email_draft` client → webmaster email contains TL;DR, FAQ, JSON-LD; item marked published with `channel:"email_draft"`; event still emitted (syndication may still run — GBP/FB don't need the blog URL? They do for CTA → WF-7 handles null URL by using booking link CTA). 
+9. Switch off `content_engine` → cron skips client, drafts in flight (pending_approval) stay parked untouched.
+
+---
+
+### 3.6 WF-5 Directory Sync
+
+**Module:** `directory_sync`. Settings: `auto_push: true`, `audit_frequency: "quarterly"`, `directory_set: "brightlocal_default"`.
+**BrightLocal auth:** all calls send `api-key: {{ $env.BRIGHTLOCAL_API_KEY }}` (plus sig where the endpoint family requires it). Base URL `https://tools.brightlocal.com/seo-tools/api`. **The exact endpoint paths below must be confirmed against the current BrightLocal API reference during N8N-12; the node structure and payloads are fixed.**
+
+**Triggers (three lanes in one workflow):**
+- Webhook path `profile-updated`, event `profile.updated` (`payload: {location_id, changed: ["hours","phone",…], profile: {name, address_json, phone, hours_json, holiday_hours_json, website}}`) → PUSH lane.
+- Schedule `0 4 * * *` (daily) → STATUS-POLL lane.
+- Schedule `0 5 1 1,4,7,10 *` (quarterly) → AUDIT lane.
+
+| # | Node name | Type | Key parameters |
+|---|---|---|---|
+| 1–6 | *(Head A for webhook / Head B for schedules, module `directory_sync`)* | | |
+| — | **PUSH lane** (`profile.updated`) | | |
+| 7 | `Validate NAP` | Code | Require non-empty name, street, city, state, zip, E.164 phone; hours_json parses; reject with activity `profile.push_invalid` `status:"failed"` + ops email if not. Never push garbage to 15 directories. |
+| 8 | `Has BL Location?` | IF | `{{ $('Get Context').item.json.locations.find(l => l.id === $json.payload.location_id)?.brightlocal_location_id }}` empty → node 9; else → node 10. |
+| 9 | `BL Create Location` | HTTP Request | POST `{{BL}}/v1/clients-and-locations/locations` form/JSON body mapped from profile (business name, address, phone, urls, business category). → `{location_id}` → `Persist BL ID`: PATCH `…/api/internal/locations/{{ location_id }}` `{"brightlocal_location_id": …}`. Then → `BL Baseline Audit` (same call as AUDIT lane node 15) — the before-number for the case study (doc 03 onboarding). |
+| 10 | `BL Update Location` | HTTP Request | PUT `{{BL}}/v1/clients-and-locations/locations/{{ brightlocal_location_id }}` with changed fields. Retry 3×; On Error: Continue → park + ops email. |
+| 11 | `BL Start Sync` | HTTP Request | POST Citation Builder submission for the location (BrightLocal "CBT" campaign / listings sync per directory_set). Response: submission id → PATCH internal location `detail.bl_submission_id`. |
+| 12 | `GBP Direct Push?` | IF | `{{ ['hours','holiday_hours','phone'].some(f => $json.payload.changed.includes(f)) && $('Get Context').item.json.connections.google_business?.status === 'active' && $('Get Context').item.json.module.settings.gbp_mode !== 'places_interim' }}` — hours pushed straight to GBP because aggregator propagation is slow (doc 03). False → activity `gbp.push_skipped` detail reason (interim mode: ops updates via manager access). |
+| 13 | `GBP Update Hours` | HTTP Request | PATCH `https://mybusinessbusinessinformation.googleapis.com/v1/{{ gbp_location_id }}?updateMask=regularHours,specialHours,phoneNumbers` · Bearer context token · body built by Code node `Map Hours → GBP` (hours_json → `regularHours.periods[]`, holiday_hours_json → `specialHours`). Error → connection-broken lane (as WF-1B). |
+| 14 | `Log Push` | HTTP Request | POST activity `action:"profile.pushed"` detail `{changed, bl_submission_id, gbp_pushed: bool}`. |
+| — | **STATUS-POLL lane** (daily) | | |
+| 15 | `BL Submission Status` | HTTP Request | Per client-location with an open submission: GET CBT campaign/submission status → `[{directory, status: live|pending|failed, url}]`. |
+| 16 | `Update Listings Health` | HTTP Request | PATCH internal location `{"listings_health_score": <live/total*100>, "detail":{"per_directory": [...]}}` + activity `listings.status` — honest per-directory status in portal ("12/15 synced, 3 pending" — doc 03; no silent claims of consistency). |
+| — | **AUDIT lane** (quarterly) | | |
+| 17 | `BL Run Citation Audit` | HTTP Request | POST citation-tracker report run for the location → poll (Wait 10 min → GET report ×6 max) → results. |
+| 18 | `Diff & Fix` | Code + HTTP | Diff new inconsistencies vs stored per-directory state → for each fixable diff POST the sync (node 11 call) → PATCH location health + activity `listings.audit` detail `{new_inconsistencies, fixes_submitted}` → portal report (SPEC-05 renders). |
+
+**Idempotency:** BL location create guarded by the `brightlocal_location_id` IF; submissions idempotent per (location, day) — Code node skips if `bl_submission_id` open; `profile.updated` replays are harmless (same PUT payload).
+
+**Acceptance tests (WF-5)**
+
+1. First `profile.updated` for a location with no BL id → location created in BrightLocal, id persisted, baseline audit kicked off, sync submitted.
+2. Replay the same event → no second BL location (IF routes to update), no duplicate submission same-day.
+3. Hours change with active Google connection (`gbp_mode: api`) → GBP `regularHours` PATCHed within the run; BL sync also submitted.
+4. Hours change in `places_interim` mode → BL push happens, GBP push skipped with logged reason.
+5. BL API 500 ×3 on update → parked + ops email; GBP push still attempted (lanes independent).
+6. Daily poll after 3 directories go live → `listings_health_score` recalculated, per-directory statuses visible via internal API.
+7. Invalid payload (missing zip) → rejected before any vendor call, activity `failed`, ops email.
+8. Quarterly audit finds 2 drifted listings → 2 fix submissions, activity `listings.audit` with counts.
+9. Module off → pushes skipped with reason, last-known health untouched (doc 03 safe-off).
+
+---
+
+### 3.7 WF-6 Competitor Espionage
+
+**Module:** `competitor_intel`. Settings: `digest_recipients: ["owner@client.com"]` (+ ops always), `mode: "client" | "prospect"`. Competitors from `profile.competitors[]` (3–5 per client, from intake Q9). **Zero client OAuth needed — first engine live (doc 07 week 1).**
+**Prospect mode:** prospects are ordinary `clients` rows with `status: "prospect"` and `competitor_intel` enabled; the admin "prospect runner" (doc 05) creates them. `GET /api/internal/clients?module=competitor_intel&enabled=true&include_prospects=true` returns them. `mode:"prospect"` in module settings switches the digest template + recipients (Seekly only — never email a prospect's "client").
+
+#### WF-6A Espionage — Weekly Snapshot
+
+**Trigger:** Schedule cron `0 3 * * 1` (Mondays 03:00).
+
+| # | Node name | Type | Key parameters |
+|---|---|---|---|
+| 1–6 | *(Head B, module `competitor_intel`, list call includes `include_prospects=true`)* | | |
+| 7 | `Split Competitors` | Split Out | Field `profile.competitors` from context; Code node first merges `{client_id, competitor}` per item and computes `competitor_key = slugify(competitor.name)`. |
+| 8 | `Fetch Website` | HTTP Request | GET `{{ $json.competitor.website }}` · Response: string · Follow redirects · Timeout 15000 ms · **No retry, On Error: Continue** (unreachable = finding, §2.3). |
+| 9 | `Extract Text` | Code | If fetch errored → `{unreachable: true}`. Else strip `<script>/<style>/tags`, collapse whitespace, keep first 30k chars, `website_text_hash = sha256(text)`; regex-harvest price mentions (`/\$\s?\d[\d,.]*/g` with 60-char context windows) into `price_mentions[]`. **No LLM here** — weekly lane stays cheap (doc 03: "internal, cheap"); Claude only runs monthly. |
+| 10 | `Fetch Places Stats` | HTTP Request | GET `https://maps.googleapis.com/maps/api/place/details/json?place_id={{ $json.competitor.place_id }}&fields=rating,user_ratings_total,business_status,price_level&key={{ $env.GOOGLE_MAPS_API_KEY }}` · On Error: Continue (missing place_id → nulls). Public data only. |
+| 11 | `Store Snapshot` | HTTP Request | POST `…/api/internal/competitor-snapshots` body `{"client_id":…,"competitor_key":…,"captured_at":"{{ $now.toISO() }}","website_text_hash":…,"website_extract":{"text_head": <first 5k>, "price_mentions": [...], "unreachable": bool},"gbp_stats":{"rating":…,"review_count": user_ratings_total}}` + activity `competitor.snapshot`. |
+
+#### WF-6B Espionage — Monthly Digest
+
+**Trigger:** Schedule cron `0 6 1 * *` (1st of month 06:00).
+
+| # | Node name | Type | Key parameters |
+|---|---|---|---|
+| 1–6 | *(Head B, module `competitor_intel`, `include_prospects=true`)* | | |
+| 7 | `Load Month Snapshots` | HTTP Request | GET `…/api/internal/clients/{{ client_id }}/competitor-snapshots?since={{ $now.minus({days:35}).toISO() }}`. |
+| 8 | `Compute Diffs` | Code | Pure-deterministic per competitor (doc 09: "numbers stay numeric — the LLM is never the calculator"): review_count delta first→last snapshot + weekly velocity; rating delta; `text_changed` = first/last hash differ; changed price_mentions (set diff); `unreachable_weeks` count. Output one item per client: `{competitors: [ {name, review_delta, review_velocity_anomaly: delta > 2*trailing_avg, rating_delta, price_changes:[], text_changed, extract_last, unreachable_weeks} ], month}`. |
+| 9 | `All Quiet?` | Code | Flag `all_quiet = every competitor has no deltas/changes`. Digest is still generated + sent — "proof of monitoring" (doc 03) — the prompt handles brevity. |
+| 10 | `Analyze (Claude)` | HTTP Request | Anthropic call: model `claude-sonnet-5`, `max_tokens: 3000`, system **Prompt 4.4**, user content = JSON from node 8 plus `{business, industry, services, mode: client|prospect, all_quiet}`; `output_config` schema §4.4. Retry 2×; on error → ops email "digest failed for <client>" + activity failed; **do not** send a half-digest. |
+| 11 | `Render Email` | Code | Wrap `digest_html` in the branded email shell (logo header, footer). Prospect mode uses the prospect shell ("Prepared by Seekly — competitor intelligence sample for <prospect business>"). |
+| 12 | `Store Digest` | HTTP Request | POST `…/api/internal/intel-digests` body `{"client_id":…,"period":"{{ $now.minus({months:1}).toFormat('yyyy-LL') }}","body_html":…,"findings": {{ JSON.stringify($('Analyze (Claude)').item.json.findings) }} ,"sent_at":null}` → portal archive; `findings[]` later promoted to `competitive`-domain L2 insight notes by the in-app intelligence jobs (doc 09 — the digest is for humans, the notes are for the system). |
+| 13 | `Recipients` | Code | `mode==='prospect'` → `[OPS]` only; else `module.settings.digest_recipients + [OPS]`. |
+| 14 | `Send Digest` | Send Email | To = node 13 list · Subject `{{ business }} — Competitor Intelligence, {{ month }}` (prospect: `What {{ prospect }}'s competitors did last month`) · HTML = node 11. Retry 2×; then PATCH digest `sent_at` via `POST …/api/internal/intel-digests` upsert / activity `intel.digest_sent`. |
+
+**Idempotency:** snapshots append-only keyed (client, competitor, captured_at); digest per (client, period) — the intel-digests endpoint upserts on that pair, so a re-run replaces rather than duplicates, and node 14 skips email if the stored digest for the period already has `sent_at` (IF before send).
+
+**Acceptance tests (WF-6)**
+
+1. Weekly cron over a client with 3 competitors → 3 snapshot rows with hashes + GBP stats.
+2. Competitor site times out → snapshot stored with `unreachable: true`; digest later says "site unreachable this month" — never fabricated content.
+3. Competitor gains 14 reviews in the month → diff computes delta + anomaly flag; digest calls out the review spike with the number 14 exactly (deterministic math, LLM narrates).
+4. No changes anywhere → short "all quiet" digest still generated, stored, and emailed.
+5. Re-run monthly cron same day → digest upserted (one row for the period), email not re-sent (sent_at guard).
+6. Prospect-mode client → digest stored, email goes to ops ONLY, prospect shell used.
+7. Claude 500s → no email, ops alerted, snapshots untouched; re-run after fix produces the digest.
+8. Client with `competitor_intel` off → skipped in both lanes; historical snapshots retained (safe-off).
+9. Digest numbers audit: every number in the email exists in node 8's deterministic output (spot-check 3 digests — no LLM-invented figures).
+
+---
+
+### 3.8 WF-7 Syndication
+
+**Module:** `social_syndication`, sub-switches `gbp_posts`, `facebook_posts`. Settings: `utm_defaults: {source:"gbp"|"facebook", medium:"social", campaign:"syndication"}`, `cta_default: "LEARN_MORE"`.
+**Trigger:** Webhook path `content-published`, event `content.published` (from WF-4 **or** the control plane's RSS/sitemap watcher on client blogs — same envelope, `source:"rss-watch"`; syndication works even for clients who write their own content, doc 03).
+
+| # | Node name | Type | Key parameters |
+|---|---|---|---|
+| 1–6 | *(Head A, module `social_syndication`; node 6 checks `module.enabled` only — per-channel sub-switches gate their own branches below)* | | |
+| 7 | `Get Content` | HTTP Request | GET `…/api/internal/content/{{ payload.content_item_id }}` (WF-4 posts) — for RSS-sourced events skip this and use `payload.{url,title,summary}`; Code node `Normalize Source` outputs `{title, url, summary_or_body}` either way. `url` may be null (email_draft posts) → CTA falls back to `profile.booking_link`. |
+| 8 | `Cut Channels (Claude)` | HTTP Request | Anthropic call: model `claude-sonnet-5`, `max_tokens: 1500`, system **Prompt 4.5**, user = JSON `{title, url, body_or_summary (first 4k chars), business, services, service_areas, target_keywords, brand_voice, booking_link}`; `output_config` schema §4.5. Retry 2×; On Error: Continue → `Park (cut failed)`: activity failed + ops email; branch ends (do not post raw excerpts). |
+| 9 | `Validate Cuts` | Code | GBP: length ≤ 1500 chars, strip phone numbers if GBP policy config says so, no banned phrases, no ALL-CAPS shouting (`/[A-Z]{6,}/` on words), CTA url present; FB: length ≤ 5000, link present. Build final CTA URLs: `url ?? booking_link` + `?utm_source=<ch>&utm_medium=social&utm_campaign=syndication&utm_content={{ content_item_id }}`. Failures → per-channel park (a bad GBP cut must not kill the FB post). |
+| 10 | *(fan-out: two parallel branches from node 9 — per-channel isolation, doc 03)* | | |
+| — | **GBP branch** | | |
+| 11g | `GBP Enabled?` | IF | `{{ module.settings.gbp_posts !== false }}` AND cut valid. False → activity `syndication.gbp_skipped`. |
+| 12g | `GBP Mode?` | IF | `{{ module.settings.gbp_mode === 'api' && connections.google_business?.status === 'active' }}`. False → `Queue Manual GBP`: POST `…/api/internal/syndicated-posts`? — store via `PATCH`-style POST `…/api/internal/content/{{id}}` sub-resource: POST `…/api/internal/syndicated-posts` `{status:"pending_manual", channel:"gbp", body, cta_url_utm}` + activity (ops posts by hand, interim mode). |
+| 13g | `Post GBP` | HTTP Request | POST `https://mybusiness.googleapis.com/v4/{{ gbp_account_id }}/{{ gbp_location_id }}/localPosts` · Bearer context token · body `{"languageCode":"en-US","summary": {{ JSON.stringify(gbp_cut) }},"topicType":"STANDARD","callToAction":{"actionType":"{{ cta_default }}","url":"{{ cta_url_gbp }}"}}` · Retry 3×; On Error: Continue → `Park GBP`: store `status:"failed"` + ops email; **FB branch unaffected**. |
+| 14g | `Store GBP Post` | HTTP Request | POST `…/api/internal/syndicated-posts` `{"content_item_id":…,"client_id":…,"channel":"gbp","body":…,"cta_url_utm":…,"status":"posted","external_post_id":"{{ $json.name }}","posted_at":"{{ $now.toISO() }}"}` + activity `syndication.gbp_posted`. |
+| — | **Facebook branch** | | |
+| 11f | `FB Enabled?` | IF | `{{ module.settings.facebook_posts !== false && connections.meta?.status === 'active' }}`. False → activity `syndication.fb_skipped` (reason: switch or no connection). |
+| 13f | `Post Facebook` | HTTP Request | POST `https://graph.facebook.com/v21.0/{{ connections.meta.page_id }}/feed` · Query/body: `message={{ fb_cut }}`, `link={{ cta_url_fb }}`, `access_token={{ connections.meta.page_access_token }}` (short-lived, from context) · Retry 3×; On Error: Continue → `Park FB` + ops email. |
+| 14f | `Store FB Post` | HTTP Request | POST `…/api/internal/syndicated-posts` `{"channel":"facebook","status":"posted","external_post_id":"{{ $json.id }}", …}` + activity `syndication.fb_posted`. |
+| 15 | `Merge + Final Log` | Merge (Append) + HTTP | Join branches → POST activity `action:"syndication.done"` detail `{gbp: status, fb: status}`. UTM click tracking is read by in-app analytics (doc 10) — not n8n. |
+
+**Idempotency:** the syndicated-posts store is unique on `(content_item_id, channel)` — replayed `content.published` events hit the unique constraint; n8n treats the 409 response as `duplicate` success and skips the vendor call (add IF: pre-check GET `…/api/internal/syndicated-posts?content_item_id=&channel=` before each post — cheaper than relying on the constraint alone).
+
+**Acceptance tests (WF-7)**
+
+1. `content.published` from WF-4 → one GBP post + one FB post, both stored with external ids and UTM CTAs.
+2. Replay the event → zero new vendor posts (pre-check catches both), activity shows duplicates skipped.
+3. FB token invalid → FB parked + ops email; GBP post still published (per-channel isolation).
+4. `gbp_posts` off, `facebook_posts` on → only FB posts; GBP skip logged.
+5. GBP cut comes back 1700 chars → validation fails GBP branch only; ops sees the parked cut; FB proceeds.
+6. RSS-sourced event (client's own blog) → cuts generated from summary, CTA uses the blog URL, both channels post.
+7. `content.published` with null URL (email_draft) → CTA falls back to booking link with UTMs.
+8. `places_interim` GBP mode → GBP cut stored `pending_manual` for ops; nothing calls the GBP API.
+9. Module off entirely → event ignored, not queued (doc 03 safe-off: "`content.published` events ignored").
+
+---
+
+## 4. AI prompt templates
+
+Rules that apply to **every** template:
+
+- Placeholders `«like_this»` are filled by n8n expressions from the **context endpoint** (§2.6); the mapping table under each prompt is exact.
+- Every call sets `output_config: {format: {type: "json_schema", schema: …}}` (§2.8) — the model returns only the JSON object; no prose parsing anywhere.
+- Shared guardrails (from docs 02/03/08, embedded verbatim in each system prompt):
+  - **Never state or promise prices, discounts, availability, or guarantees** unless the exact fact appears in BUSINESS FACTS. The intake's "never promise" list («ai_never_promise») is absolute.
+  - **Never offer incentives for reviews** or mention reviews in exchange for anything (Google policy).
+  - **Never fabricate** facts, numbers, testimonials, or competitor claims. If you don't know, say a human will follow up.
+  - Compliance (opt-out lines, quiet hours, frequency) is handled by the platform — **never** add "reply STOP" or similar footers yourself.
+  - Write in the brand voice: tone «brand_voice.tone», use phrases like «brand_voice.phrases_use», never use «brand_voice.phrases_avoid». Match the register of «brand_voice.example_sentences».
+
+### 4.1 WF-2 conversation agent (first touch + conversation loop)
+
+**System prompt template:**
+
+```
+You are «persona_name», the friendly virtual assistant for «business_name», a «industry» business in «city». You are texting (SMS) with a potential customer who just reached out. MODE: «mode».   // "first_touch" | "conversation"
+
+YOUR JOB
+1. Reply fast, warm, and specific — reference exactly what they asked about.
+2. Work through the qualification questions ONE at a time, weaving them naturally into conversation (never as a form):
+«qualification_questions»   // rendered as "- id: question (hot when: hot_signal)" lines
+3. When the lead is qualified (all questions answered, or a hot signal appears), move them to booking: share «booking_link» and encourage them to pick a time.
+4. Keep every message under 300 characters. One question per message, max. Plain text only, no markdown.
+
+BUSINESS FACTS (the ONLY facts you may state)
+- Services: «services»
+- Areas served: «service_areas»
+- Booking: «booking_link»
+- Hours: «hours_summary»
+
+HARD RULES
+- NEVER promise or estimate: «ai_never_promise». If asked, say: "Great question — the owner will text you the details directly."
+- If the customer is upset, mentions a complaint, legal issues, or negotiates price → set status to "needs_human" and write a short, warm holding reply.
+- Never fabricate availability, staff names, or policies. Never mention being an AI unless directly asked; if asked, answer honestly and continue helping.
+- Never add opt-out/STOP language — the platform appends it.
+- Brand voice: tone «brand_voice.tone»; use: «phrases_use»; avoid: «phrases_avoid». Sound like: «example_sentences».
+- After-hours (customer wrote outside «business_hours»): acknowledge you're answering right away anyway; do not promise a human until opening hours. «after_hours_note»
+
+OUTPUT: a single JSON object per the schema. "extracted" must contain any qualification answers you can infer from the whole transcript, keyed by question id. Set confidence 0–1 for how sure you are the reply is appropriate and on-policy.
+```
+
+**Output JSON schema:**
+
+```json
+{ "type": "object", "additionalProperties": false,
+  "required": ["reply_text", "status", "confidence", "extracted"],
+  "properties": {
+    "reply_text": { "type": "string" },
+    "status": { "type": "string", "enum": ["continue", "qualified", "needs_human"] },
+    "confidence": { "type": "number" },
+    "extracted": { "type": "object", "additionalProperties": { "type": "string" } },
+    "summary_for_owner": { "type": "string" }
+  } }
+```
+
+**Placeholder map:** `persona_name` ← `module.settings.persona_name ?? profile.brand_voice.persona_name` · `business_name` ← `client.business_name` · `industry` ← `client.industry` · `city` ← `locations[0].address_json.city` · `mode` ← literal per call site · `qualification_questions` ← `profile.qualification_questions` (Code-rendered lines) · `booking_link` ← `profile.booking_link` · `services` ← `profile.services.join(', ')` · `service_areas` ← `profile.service_areas.join(', ')` · `hours_summary` ← Code-rendered from `locations[0].hours_json` · `ai_never_promise` ← `profile.ai_never_promise.join('; ')` · `brand_voice.*` ← `profile.brand_voice` · `business_hours`/`after_hours_note` ← `module.settings`.
+
+### 4.2 WF-1 review responses
+
+**System prompt template:**
+
+```
+You write the public owner responses to Google reviews for «business_name» («industry», «city»). Every response is read by future customers AND by search/AI engines — it is marketing and local SEO in one.
+
+STYLE
+- Brand voice: tone «brand_voice.tone»; use: «phrases_use»; avoid: «phrases_avoid».
+- 2–4 sentences. Address the reviewer by first name when given. Vary openings — never start two responses the same way.
+- Weave in AT MOST ONE natural local/entity reference per response, drawn ONLY from: «target_keywords», «services», «service_areas», «landmarks». Forced keyword stuffing is worse than none.
+
+RATING RULES
+- 4–5 stars: thank them, mirror one specific detail they mentioned, invite them back (reference a real service).
+- 1–3 stars: empathetic, accountable, zero defensiveness, no excuses, never argue facts. Apologize for the experience (not "if you felt"), state one concrete make-it-right step, and take it offline: invite them to contact «owner_contact_channel». Do NOT offer refunds, discounts, or compensation.
+
+HARD RULES
+- NEVER offer incentives, discounts, or anything in exchange for the review or for changing it (Google policy — instant policy violation).
+- NEVER promise: «ai_never_promise».
+- Never dispute what happened, never mention other customers, never share personal data, never mention internal staff issues.
+- No hashtags, no emojis unless «brand_voice.tone» explicitly allows them, no URLs.
+
+Also produce service_recovery_suggestion: one sentence the OWNER (not the reviewer) should do next for ≤3★ reviews (e.g. "Call them today and offer to personally host their next visit"). Empty string for 4–5★.
+
+OUTPUT: single JSON object per schema.
+```
+
+**Output JSON schema:** `{"type":"object","additionalProperties":false,"required":["reply_text","service_recovery_suggestion"],"properties":{"reply_text":{"type":"string"},"service_recovery_suggestion":{"type":"string"}}}`
+
+**Placeholder map:** `landmarks` ← `profile.service_areas` + intake landmark list if present (`profile.target_keywords` doubles as entity source) · `owner_contact_channel` ← `locations[0].phone` or configured email · rest as §4.1. Review itself arrives in the **user** message (rating, author, text) — never in the system prompt.
+
+### 4.3 WF-3 campaign composer
+
+**System prompt template:**
+
+```
+You write SMS win-back campaigns for «business_name» («industry», «city»). The audience: past customers who haven't visited in «lapse_days»+ days. Goal: one warm, personal-feeling text that gets a reply or a booking — not a blast ad.
+
+THE APPROVED ANGLE (you may ONLY make this offer, worded faithfully):
+- Name: «angle.name»
+- Offer: «angle.offer»
+- Constraints: «angle.constraints»
+
+WRITE 3 VARIANTS. Each must:
+- Feel like a text from a real person at the business, not a campaign. Brand voice: tone «brand_voice.tone»; use: «phrases_use»; avoid: «phrases_avoid».
+- Use merge fields literally: {first} (customer first name), {business}, {last_visit_note}, {offer}, {booking_link}. Include {first} and {booking_link} in every variant. Do not invent other fields.
+- Be ≤ 300 characters BEFORE merge expansion. One clear call to action. No ALL CAPS, max one exclamation mark, no emojis unless tone allows.
+- Differ meaningfully from each other (angle of approach, not synonyms): e.g. friendly check-in / event or occasion hook / straight offer.
+
+HARD RULES
+- State ONLY the approved offer — no invented discounts, prices, dates, or urgency ("today only") unless present in «angle.offer» verbatim.
+- NEVER promise: «ai_never_promise».
+- No opt-out language ("reply STOP") — the platform appends it.
+- Nothing that would embarrass the owner if screenshotted.
+
+OUTPUT: single JSON object per schema.
+```
+
+**Output JSON schema:** `{"type":"object","additionalProperties":false,"required":["variants"],"properties":{"variants":{"type":"array","minItems":3,"maxItems":3,"items":{"type":"object","additionalProperties":false,"required":["id","body"],"properties":{"id":{"type":"string"},"body":{"type":"string"}}}}}}`
+
+**Placeholder map:** `angle.*` ← the `profile.campaign_angles[]` entry whose `id` equals `campaign.angle` · `lapse_days` ← `module.settings.lapse_days` · rest as §4.1.
+
+### 4.4 WF-6 digest analyst
+
+**System prompt template:**
+
+```
+You are Seekly's competitive intelligence analyst. You write the monthly competitor digest for «business_name» («industry», «city»). Reader: the busy owner. MODE: «mode».   // "client" | "prospect"
+
+INPUT: a JSON diff computed by our systems — review deltas, rating changes, detected price/offer text changes, website-change flags, unreachable flags. These numbers are ground truth.
+
+WRITE
+1. digest_html: a short, punchy HTML email body (no <html>/<head> wrapper — content only):
+   - Opening line: the single most important thing that happened this month, framed as money/threat/opportunity.
+   - One section per competitor with material changes: what changed, why it matters to «business_name», and ONE recommended counter-move the owner could take this month. Concrete, small, doable.
+   - Review-velocity spikes: call them out explicitly ("gained N reviews — they are likely running a review campaign").
+   - Competitors with no changes: one collective line. Unreachable sites: say "site unreachable this month" — never guess at their content.
+   - If input has all_quiet=true: a 4–6 line "all quiet" digest confirming monitoring ran and what we watched. Still useful, still confident.
+   - Close (client mode): one line on what Seekly is doing about it automatically. (prospect mode): one line: "This is a sample of Seekly's monthly monitoring."
+2. findings: machine-readable findings for our intelligence system.
+
+HARD RULES
+- Every number in your output MUST appear in the input JSON. Never invent counts, prices, or dates. Never fabricate offers you can't quote from website_extract.
+- No generic filler ("in today's competitive landscape"). Every sentence earns its place.
+- Recommended counter-moves must be things a local business can actually do (offer, event, review push, GBP post, page update) — never "consider a comprehensive strategy".
+- Prospect mode: do not reveal or imply access to the prospect's own private data — competitor data is public.
+```
+
+**Output JSON schema:**
+
+```json
+{ "type": "object", "additionalProperties": false,
+  "required": ["digest_html", "findings"],
+  "properties": {
+    "digest_html": { "type": "string" },
+    "findings": { "type": "array", "items": { "type": "object", "additionalProperties": false,
+      "required": ["competitor", "domain", "finding", "evidence", "recommended_counter", "confidence"],
+      "properties": {
+        "competitor": { "type": "string" },
+        "domain": { "type": "string", "enum": ["competitive"] },
+        "finding": { "type": "string" },
+        "evidence": { "type": "string" },
+        "recommended_counter": { "type": "string" },
+        "confidence": { "type": "number" } } } } } }
+```
+
+**Placeholder map:** `mode` ← `module.settings.mode ?? 'client'`; rest as §4.1. The diff JSON goes in the **user** message. `findings[].domain` is fixed `"competitive"` so the in-app job can file them as L2 notes (doc 09).
+
+### 4.5 WF-7 channel cutter
+
+**System prompt template:**
+
+```
+You repurpose one blog post into channel-native local social content for «business_name» («industry», «city»). Two outputs, written independently — never a truncated copy of each other.
+
+1. gbp_post — Google Business Profile "What's New" post:
+   - ≤ 1400 characters (hard platform limit 1500 — leave headroom).
+   - Local-intent first: open with the concrete benefit/insight for people in «service_areas», not with "New blog post!".
+   - Naturally include 1–2 of: «target_keywords», one service from «services», one geo reference from «service_areas». No stuffing.
+   - End with a soft prompt to act; the CTA button ("Learn more") is added by the platform — do not write "click the link below".
+   - GBP policy: no phone numbers, no ALL-CAPS words, no excessive punctuation/emoji, no offers or prices unless present verbatim in the source post.
+2. facebook_post — Page update:
+   - Looser, community tone; 2–5 short paragraphs or lines; a hook first line; it's fine to be warmer/more personal. Link preview does the selling — don't paste the URL in the text (the platform attaches it).
+   - May use up to 2 emojis if brand tone allows.
+
+BOTH: brand voice tone «brand_voice.tone»; use: «phrases_use»; avoid: «phrases_avoid». Facts only from the source post and BUSINESS FACTS. NEVER promise: «ai_never_promise». No review solicitation. No hashtag walls (max 2 on Facebook, 0 on GBP).
+
+OUTPUT: single JSON object per schema.
+```
+
+**Output JSON schema:** `{"type":"object","additionalProperties":false,"required":["gbp_post","facebook_post"],"properties":{"gbp_post":{"type":"string"},"facebook_post":{"type":"string"}}}`
+
+**Placeholder map:** as §4.1; the source post `{title, url, body_or_summary}` arrives in the user message.
+
+### 4.6 WF-4 content drafter (referenced by §3.5 node 10)
+
+**System prompt template (condensed — the GEO pattern from doc 03 flow 3):**
+
+```
+You write local-SEO/GEO blog posts for «business_name» («industry», «city») that rank in Google AND get cited by AI engines. Audience: local customers searching high-intent queries.
+
+STRUCTURE (mandatory): H1 with the primary keyword; TL;DR block first (3–4 bullet answers, direct and quotable); H2 sections answering the topic and People-Also-Ask-style subquestions; FAQ section (4–6 Q&As, conversational questions); semantic entity references woven in (place names from «service_areas», services from «services», local landmarks); 2–3 internal link placeholders as <a href="{{internal:slug-suggestion}}">anchor</a>.
+
+JSON-LD: produce valid schema.org markup — LocalBusiness (name/address/phone EXACTLY as given in BUSINESS FACTS), Service for the topic service, FAQPage mirroring the FAQ section verbatim.
+
+HARD RULES: facts, prices, hours, offerings ONLY from BUSINESS FACTS — a single invented price fails the whole draft. NEVER promise: «ai_never_promise». ≥ «min_words» words. Brand voice per «brand_voice». No fluff intros ("In today's world…"). Write to be quoted: short declarative answer sentences at the top of each section.
+
+OUTPUT: single JSON object per schema (title, slug, meta_description, tldr_html, body_html, faq[], jsonld, internal_link_suggestions[]).
+```
+
+Placeholder map as §4.1 plus `min_words` ← `module.settings.min_words`; topic/keywords/competitor-gap notes arrive in the user message.
+
+---
+
+## 5. Ticket table and build order
+
+Assumed companion specs (referenced as dependencies): **SPEC-01** control-plane schema migrations (doc 10 table list) · **SPEC-02** internal API (core four + §2.7 additions + event router/HMAC forwarding + HubSpot inbound) · **SPEC-03** send-pipeline service (`/api/internal/send` + inbound SMS → `message.received`) · **SPEC-04** integration hub (Google/Meta OAuth vault, email-parse → events, short-lived token minting) · **SPEC-05** portal additions (approvals queue, switchboard, campaign creation, intake/prospect runners).
+
+| # | Ticket | Builds | Depends on | Order rationale |
+|---|---|---|---|---|
+| N8N-1 | Deploy n8n stack | §1 compose, proxy, backups, export script, `Anthropic Seekly` + `SMTP Seekly Ops` credentials | VPS + DNS only | Day 1 of week 1. |
+| N8N-2 | WF-E + standard head proven | §2.2 error workflow; head Shape A+B built in a `WF-TEST Dummy` workflow against a seeded dummy client | SPEC-01 (clients row), SPEC-02 (context, activity, events, HMAC forwarding) | Doc 07 week 1: "standard workflow shell proven with a dummy client". Blocks everything below. |
+| N8N-3 | WF-6A + WF-6B live | §3.7 | N8N-2; SPEC-02 (`clients?module=`, snapshots, intel-digests endpoints); Places API key | First engine live — zero client OAuth (doc 07 week 1). Generates pilot digest + 2–3 prospect digests. |
+| N8N-4 | WF-0 lite (manual provisioning) | §3.1 with manual `client.provisioned` events; `provision/*` endpoints stubbed to core steps (no HubSpot) | SPEC-01, SPEC-02 (provision endpoints), Twilio account | Pilot tenant creation week 1; full HubSpot path deferred to N8N-13. |
+| N8N-5 | WF-1A requests | §3.2 A | N8N-2; SPEC-03 (`/send`); SPEC-02 (eligibility); email-parse live (SPEC-04) for real `sale.completed` | Week 2 milestone. Runs in shadow mode until A2P approved (pipeline blocks sends — flip = A2P status change, no workflow change). |
+| N8N-6 | WF-1B poller + WF-1C responder | §3.2 B/C, interim `places_interim` mode | N8N-2; SPEC-02 (reviews PATCH, event routing); Places key; portal approvals (SPEC-05) for queue modes | Week 2: detection via Places, replies via approval queue + ops manual publish until GBP API approval lands. |
+| N8N-7 | WF-2A first touch + follow-ups | §3.3 A | N8N-2; SPEC-03; SPEC-02 (conversations, eligibility); email-parse form CC live | Week 2 milestone (`<60s` promise). |
+| N8N-8 | WF-2B conversation loop | §3.3 B | N8N-7; SPEC-03 inbound → `message.received` | Immediately after N8N-7 — first-touch without a reply loop is a broken promise. |
+| N8N-9 | WF-3 campaign runner | §3.4 | N8N-8 (reply routing); SPEC-02 (campaigns endpoints); SPEC-05 (campaign creation + approval); customer CSV imported | Weeks 3–4. |
+| N8N-10 | WF-4 content engine | §3.5 | N8N-2; SPEC-02 (content endpoints); WordPress creds or webmaster email per intake | Weeks 3–4; feeds WF-7. |
+| N8N-11 | WF-7 syndication | §3.8 | N8N-10 (event source); SPEC-04 (Meta page token in context); GBP interim path from N8N-6 | Immediately after first WF-4 publish. |
+| N8N-12 | WF-5 directory sync | §3.6 | N8N-2; SPEC-02 (locations PATCH); BrightLocal account/key; portal profile editing emits `profile.updated` (SPEC-05) | Weeks 3–4; baseline audit ASAP for the before-number. Confirm BL endpoint paths here. |
+| N8N-13 | WF-0 full (HubSpot end-to-end) | HubSpot Closed-Won → control plane → WF-0; sync-back fields | N8N-4; SPEC-02 HubSpot inbound + sync-back | Weeks 3–4 (doc 07). |
+| N8N-14 | Hardening pass | Replay drills for every acceptance test marked idempotency; STOP-rate auto-pause test; switch-off-mid-flight tests; restore-from-backup drill; GBP API swap-in (`gbp_mode: api`) when approval lands | All above | Doc 07 weeks 3–4 hardening list, verbatim. |
+
+**Definition of done per ticket:** all numbered acceptance tests for the workflow pass against staging; workflow JSON exported and committed (§1.4); every action visible in `activity_log`; WF-E fires on an induced failure within 5 minutes.
+
+---
+
+## Appendix A — Open questions (tracked; do not block N8N-1..3)
+
+1. **BrightLocal endpoint paths** (§3.6) — structure fixed, paths to be confirmed against current BL docs during N8N-12.
+2. **`GET /api/internal/campaigns?client_id&status=sending`** list form is implied by the WF-3 cron lane — confirm inclusion in SPEC-02.
+3. **Places review IDs are synthetic** (§3.2 WF-1B node 10) — acceptable for interim mode? Duplicate-risk window is small (author+time hash) but nonzero; GBP API mode eliminates it.
+4. **`review.received` payload must echo `response_status`** for the WF-1C replay guard — confirm the event router enriches payloads from the reviews table.
+5. **Meta Graph API version pin** (`v21.0` in §3.8) — bump to current stable at N8N-11 build time and record in the workflow JSON.
+

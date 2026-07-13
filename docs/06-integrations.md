@@ -64,12 +64,17 @@ No universal "Connect Website" OAuth exists — platform decided per intake:
 
 | Platform | Method |
 |---|---|
+| **Wix** | **Native OAuth (Day-1/Wave-1) — one "Connect Wix" also covers bookings, forms, and contacts. See [specs/11-native-adapters.md](../specs/11-native-adapters.md).** |
 | WordPress | REST API + Application Password (client creates a Seekly editor user) |
-| Webflow / Shopify / Wix / Squarespace | Native APIs where plans allow; else `email_draft` |
+| Webflow / Shopify | Native OAuth adapters (Wave 2, spec 11) |
+| Squarespace | No content-publish API → `email_draft` (20% bucket) |
 | Custom / unknown | `email_draft` fallback: HTML + instructions to their webmaster |
 
 `email_draft` keeps the content engine universal on day one; native publishing is an upgrade
-per client.
+per client. **The first pilot runs on Wix, so the Wix adapter is built Day-1** — for that client
+Wix is not just a publishing target but the primary source of `sale.completed` (Wix
+Bookings/eCom), `lead.created` (Wix Forms), and the reactivation audience (Wix Contacts),
+covering engines WF-1/WF-2/WF-3/WF-4/WF-7 from a single connection.
 
 ## POS / booking systems (the adapter ladder in practice)
 
@@ -82,6 +87,7 @@ Native adapters (built when an intake names them, in likely order of demand):
 
 | System | Niche | Hooks |
 |---|---|---|
+| **Wix (Day-1)** | golf/rec, any Wix site | Bookings *Booking Confirmed* + eCom *Order Paid* → `sale.completed`; Forms → `lead.created`; Contacts → `customer.imported` |
 | Square | rec/retail/golf | Payments/Orders webhooks → `sale.completed`; Customers API → `customer.imported` |
 | Skedda / booking tools | golf sims, venues | Booking webhooks/Zapier bridge → `sale.completed` |
 | Mindbody | fitness/rec | Webhooks API |

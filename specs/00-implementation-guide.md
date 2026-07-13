@@ -18,6 +18,7 @@ the consolidated open-decisions list.
 | [08-intelligence-jobs.md](08-intelligence-jobs.md) | `INT-` | pg-boss rollups, anomalies, insights, briefs, WF-8 action queue |
 | [09-provisioning-hubspot.md](09-provisioning-hubspot.md) | `PR-` | HubSpot setup, Closed Won → provision saga, status sync-back |
 | [10-testing-acceptance.md](10-testing-acceptance.md) | `QA-` | Compliance/replay/switch/drill suites, go-live checklist, alerting |
+| [11-native-adapters.md](11-native-adapters.md) | `AD-` | Native OAuth adapters; **Wix is Day-1/Wave-1** (pilot runs on Wix), shared adapter framework, coverage/wave matrix, vertical map |
 
 ## Precedence rules (when documents disagree)
 
@@ -35,7 +36,8 @@ the consolidated open-decisions list.
 **Phase 0 — Day 1, mostly human (do these before/while coding):**
 external approvals — Twilio A2P (SP-2 console path), GBP API application + OAuth consent
 (OA GCP setup steps), Meta dev app + pilot tester, BrightLocal account, HubSpot portal setup
-(PR-1, PR-2), SendGrid inbound domain (EP-1 DNS), pilot intake form sent (docs/08).
+(PR-1, PR-2), SendGrid inbound domain (EP-1 DNS), **Seekly Wix App creation (AD-W1) — the pilot
+runs on Wix, so file this Day-1**, pilot intake form sent (docs/08).
 
 **Phase 1 — Week 1 (foundation, no client OAuth needed):**
 `DB-*` → `API-1..4` (auth, events, context, activity) → `SP-*` (send pipeline + inbound) →
@@ -44,9 +46,13 @@ espionage build (needs only internal API) → `PR-5` manual pilot provisioning.
 Gate: QA idempotency/replay suite green on events + sends.
 
 **Phase 2 — Week 2 (pilot live milestone):**
-`OA-*` Google flow + `UI-1` Integrations page → WF-1 Review Velocity (shadow mode until A2P
-approval; interim GBP manager-access mode until API approval) → WF-2 Speed-to-Lead (email-parse
-leads) → portal MVP cut (Overview cards, Reviews feed, admin switchboard).
+`AD-1` adapter framework + **`AD-W2/W3` Wix connect + webhooks** (the pilot's primary
+integration — one connect lights up WF-1/WF-2/WF-3/WF-4/WF-7) → `OA-*` Google flow + `UI-1`
+Integrations page → WF-1 Review Velocity (fed by Wix Bookings/eCom `sale.completed`; shadow mode
+until A2P approval; interim GBP manager-access mode until API approval) → WF-2 Speed-to-Lead
+(Wix Forms `lead.created`) → portal MVP cut (Overview cards, Reviews feed, admin switchboard).
+`AD-W4` (Wix contacts backfill → WF-3) and `AD-W5` (Wix Blog publish → WF-4/WF-7) follow in
+weeks 3–4 or immediately if the pilot prioritizes reactivation/content.
 Gate: QA compliance suite (C-1..C-10) green BEFORE first real send; go-live checklist for pilot.
 
 **Phase 3 — Weeks 3–4 (full platform):**
@@ -72,6 +78,7 @@ are already writing).
 | R-8 | HubSpot Closed Won stage ID if a custom pipeline is used instead of renamed default | PR-1/PR-3 |
 | R-9 | `insights.embedding` ships as jsonb; pgvector upgrade deferred | INT phase |
 | R-10 | Health Score syncs as null until INT rollups exist | PR-6 |
+| R-11 | `connections.provider` enum must add `wix` (Wave 1) + the other adapter providers as waves open (list in spec 11) | DB-1 / AD-1 |
 
 ## Pinned policy decisions (QA spec §0 enforces these — founder may overrule)
 

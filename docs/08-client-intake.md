@@ -78,3 +78,33 @@ The form output auto-builds the onboarding checklist, e.g. for the golf pilot:
 
 Every unchecked box maps to exactly one blocked module — the switchboard shows *why* a module
 can't turn on yet.
+
+---
+
+## Pilot profile (pre-filled) — Norm's Golf & Social
+
+First pilot. Detected from public info (site is Wix; live fetch was egress-policy blocked, so
+platform inferred from Wix Bookings URL patterns `/book-online` + `/service-page/…` — confirm in
+onboarding). Business: golf-simulator social clubhouse (4 Trackman iO sims + bar + leagues +
+events), 616 Gardiners Road, Kingston ON. Contact `booking.norms.kingston@gmail.com`,
+647-594-6676. Social: facebook.com/norms.kingston, instagram.com/norms.kingston.
+
+Resolver inputs (spec 12):
+
+| Field | Value |
+|---|---|
+| `website_platform` | `wix` |
+| `website_handles_bookings` | `true` (Wix Bookings — sim sessions sold as services) |
+| `pos_system` | Wix Bookings (same) |
+| `uses_meta_ads` | confirm at intake (FB + IG present) |
+| `has_customer_list` | Wix Contacts (via adapter backfill) |
+| `enabled_modules` | all (free pilot) |
+
+→ **Resolved connectors: `wix` (required), `google_business` (required), `meta` (recommended).**
+No POS, CSV, or email-parse needed — the clean "one connection" case.
+
+Niche config seeds: reactivation angle = **league nights / lapsed players**; content + syndication
+topics = leagues, events, live music, corporate/private bookings; qualification (speed-to-lead)
+= party size, date, session length, occasion. Day-1 to-dos specific to this pilot: create the
+Seekly Wix App (AD-W1) + share install link; GBP manager invite; A2P registration (need Norm's
+EIN/business number); add their FB/IG as Meta app testers.

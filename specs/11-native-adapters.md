@@ -250,11 +250,30 @@ pulls contacts changed since the watermark; no duplicate customers (unique on `c
 5. `POST /blog/v3/draft-posts/{id}/publish` → returns the live post → capture URL → emit
    `content.published` (which WF-7 syndicates to GBP + Facebook).
 
-**Gotchas:** Ricos conversion is the real work here (biggest risk in the Wix adapter); ship it
-with unit tests over representative posts. FAQ/schema blocks from the GEO template must degrade
-gracefully into Ricos (FAQ as headed Q/A paragraphs; JSON-LD can't be injected into Wix Blog
-body — note this limitation: on Wix, schema richness is lower than WordPress, so directory-sync
-+ GBP carry more of the GEO weight for Wix clients).
+**Gotchas & schema handling:** Ricos conversion is the real work here (biggest risk in the Wix
+adapter); ship it with unit tests over representative posts. FAQ blocks render as headed Q/A
+paragraphs in the Ricos body.
+
+Structured-data / schema on Wix (corrected — schema IS supported, several ways):
+- **Automatic:** every published Wix Blog post gets `BlogPosting`/`Article` preset markup, and
+  Wix auto-generates additional structured data for eligible posts — so our published content is
+  never schema-less. ([auto structured data](https://support.wix.com/en/article/using-ai-generated-structured-data-for-blog-posts))
+- **Custom JSON-LD, manual:** per page via Editor → SEO Basics → Advanced SEO → Structured Data
+  Markup (JSON-LD only, **< 7,000 chars/markup**). Use a one-time onboarding pass to add
+  `FAQPage` / richer `LocalBusiness` / `Service` to evergreen pages.
+  ([add markup](https://support.wix.com/en/article/adding-structured-data-markup-to-your-sites-pages-2546962))
+- **Programmatic:** `wixSeoFrontend.setStructuredData()` (Velo, runs on the site) can set JSON-LD
+  dynamically — a path to automate custom schema if we ship a small Velo snippet on the client's
+  site. ([Velo setStructuredData](https://dev.wix.com/docs/velo/api-reference/wix-seo-frontend/set-structured-data))
+- **AD-W5a (verify):** confirm whether the Blog `create-draft-post` REST object accepts a
+  settable `seoData` (structured-data tags) field. **If yes, our backend adapter can inject
+  custom JSON-LD (FAQPage etc.) end-to-end with no manual step** — this is the preferred path;
+  fall back to the manual onboarding pass only if the REST field can't carry structured data.
+
+Net: Wix content ships with automatic Article schema; custom schema is available manually or
+(pending AD-W5a) programmatically. Wix's custom-schema *automation* is thinner than WordPress,
+so if AD-W5a fails, directory-sync + GBP carry more of the GEO weight for Wix clients — but the
+site is not schema-poor.
 
 **Acceptance:** a WF-4 draft publishes to the pilot's Wix blog with correct headings/images and
 emits `content.published`; the published URL is reachable.

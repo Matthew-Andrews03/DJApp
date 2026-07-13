@@ -19,6 +19,7 @@ the consolidated open-decisions list.
 | [09-provisioning-hubspot.md](09-provisioning-hubspot.md) | `PR-` | HubSpot setup, Closed Won → provision saga, status sync-back |
 | [10-testing-acceptance.md](10-testing-acceptance.md) | `QA-` | Compliance/replay/switch/drill suites, go-live checklist, alerting |
 | [11-native-adapters.md](11-native-adapters.md) | `AD-` | Native OAuth adapters; **Wix is Day-1/Wave-1** (pilot runs on Wix), shared adapter framework, coverage/wave matrix, vertical map |
+| [12-connector-resolution-onboarding.md](12-connector-resolution-onboarding.md) | `CN-` | Per-client connector resolution + tailored onboarding — each client sees ONLY the 2–4 connectors they need, not the full catalog |
 
 ## Precedence rules (when documents disagree)
 
@@ -79,6 +80,7 @@ are already writing).
 | R-9 | `insights.embedding` ships as jsonb; pgvector upgrade deferred | INT phase |
 | R-10 | Health Score syncs as null until INT rollups exist | PR-6 |
 | R-11 | `connections.provider` enum must add `wix` (Wave 1) + the other adapter providers as waves open (list in spec 11) | DB-1 / AD-1 |
+| R-12 | Extend `onboarding_tasks` with `requirement` + `unlocks_modules`; ensure `client_profile` has `website_platform`/`pos_system`/`uses_meta_ads` for the resolver (spec 12) | DB-1 / CN-3 |
 
 ## Pinned policy decisions (QA spec §0 enforces these — founder may overrule)
 
